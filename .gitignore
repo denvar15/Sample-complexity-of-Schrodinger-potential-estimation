@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and tooling
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# Pretrained ALAE weights, ~2.3 GB. The download script that fetches them lives
+# in the same directory and is tracked, since the installation instructions of
+# README.md tell the user to run it.
+/ALAE/training_artifacts/*
+!/ALAE/training_artifacts/download_all.py
+
+# Pretrained ALAE latents and FFHQ attributes, ~1.1 GB, fetched by the download
+# cell of the ALAE notebooks and by "ou_search.py --download". The cell writes
+# into data/ without creating it, so the empty directory has to survive a clone.
+/data/*
+!/data/.gitkeep
+
+# Hyperparameter search: the directory itself, the Optuna studies it writes at
+# the repository root and their SQLite side files.
+/experiments/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Figures produced by running the notebooks; example.png at the repository root
+# is tracked, it is Figure 2 of the paper.
+/notebooks/*.png
+
+# Archives
+*.zip
