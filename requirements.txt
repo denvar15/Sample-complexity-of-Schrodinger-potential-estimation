@@ -1,11 +1,13 @@
-# Dependencies of src/ and of the notebooks in notebooks/ (Python >= 3.8).
+# Dependencies of src/ and of the notebooks in notebooks/ (published environment: Python 3.11).
 # The vendored ALAE autoencoder has additional requirements in ALAE/requirements.txt.
 numpy
 scipy
 scikit-learn
 matplotlib
-torch>=1.10
-geotorch
+torch==2.5.1
+geotorch==0.3.0
+yacs
+pillow>=9.1
 tqdm
 
 # notebook frontend
