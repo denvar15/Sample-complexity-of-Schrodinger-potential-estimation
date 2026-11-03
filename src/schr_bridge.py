@@ -11,25 +11,17 @@ from torch.distributions.normal import Normal
 
 
 class Schr_Bridge(nn.Module):
-    """Schrödinger bridge with an Ornstein-Uhlenbeck reference process.
+    """SchrР“В¶dinger bridge with an Ornstein-Uhlenbeck reference process.
 
-    The shape matrices ``S_k`` of the Gaussian potentials are parameterised so
-    that ``S_k - S_lower_bound * I`` is positive definite at every optimisation
-    step: the eigenvalues are ``S_lower_bound + exp(.)`` and, in the
-    non-diagonal case, the eigenvectors are kept orthogonal by ``geotorch``.
-    The default ``S_lower_bound=1`` constrains the potentials to ``S_k > I``;
-    ``S_lower_bound=0`` recovers the plain constraint ``S_k > 0``.
-
-    The bound is one-sided by construction, but ``get_log_C_tilde`` also needs
-    the Gaussian integral to converge, i.e. ``A_k > 0``, which for the OU
-    reference means every eigenvalue of ``S_k`` must stay below
-    ``sigma_T^2 * exp(2 * b * T)``. That ceiling is astronomically large for the
-    ``(b, T)`` used in the experiments, so a lower bound of 1 is well inside it.
+    get_S() returns the dimensionless paper shape. With Sigma = epsilon I,
+    the Gaussian component covariance is epsilon * ou_sigma(b, T) * S.
+    Eigenvalues stay in the fixed interval [S_lower_bound, S_upper_bound]
+    strictly inside (0, 1), including at floating-point sigmoid saturation.
     """
 
     def __init__(self, dim=2, n_potentials=5, epsilon=1, is_diagonal=True,
-                 sampling_batch_size=1, S_diagonal_init=1.1, b=0.0, m=0.0, T=1.0,
-                 S_lower_bound=1.0):
+                 sampling_batch_size=1, S_diagonal_init=0.5, b=0.0, m=0.0, T=1.0,
+                 S_lower_bound=0.05, S_upper_bound=0.95):
         super().__init__()
         self.is_diagonal = is_diagonal
         self.dim = dim
@@ -37,29 +29,24 @@ class Schr_Bridge(nn.Module):
         self.sampling_batch_size = sampling_batch_size
         self.T = T
 
-        if not S_diagonal_init > S_lower_bound:
-            raise ValueError(
-                f"S_diagonal_init={S_diagonal_init} must be strictly greater than "
-                f"S_lower_bound={S_lower_bound}: the initial S_k has to satisfy the "
-                "constraint it is optimised under."
-            )
+        if not 0 < S_lower_bound < S_diagonal_init < S_upper_bound < 1:
+            raise ValueError("Require 0 < S_lower_bound < S_diagonal_init < S_upper_bound < 1.")
 
         self.register_buffer("epsilon", torch.tensor(epsilon))
         self.register_buffer("b", torch.tensor(b))
         self.register_buffer("m", torch.tensor(m))
         self.register_buffer("S_lower_bound", torch.tensor(float(S_lower_bound)))
 
+        self.register_buffer("S_upper_bound", torch.tensor(float(S_upper_bound)))
         self.log_alpha_raw = nn.Parameter(
             self.epsilon * torch.log(torch.ones(n_potentials) / n_potentials)
         )
         self.r = nn.Parameter(torch.randn(n_potentials, dim))
-        self.S_log_diagonal_matrix = nn.Parameter(
-            torch.log((S_diagonal_init - S_lower_bound) * torch.ones(n_potentials, self.dim))
-        )
-        self.S_rotation_matrix = nn.Parameter(
-            torch.randn(n_potentials, self.dim, self.dim)
-        )
-        geotorch.orthogonal(self, "S_rotation_matrix")
+        init_logit = math.log((S_diagonal_init - S_lower_bound) / (S_upper_bound - S_diagonal_init))
+        self.S_eigenvalue_logits = nn.Parameter(torch.full((n_potentials, dim), init_logit))
+        if not is_diagonal:
+            self.S_rotation_matrix = nn.Parameter(torch.randn(n_potentials, dim, dim))
+            geotorch.orthogonal(self, "S_rotation_matrix")
 
     def init_r_by_samples(self, samples):
         assert samples.shape[0] == self.r.shape[0]
@@ -69,9 +56,9 @@ class Schr_Bridge(nn.Module):
         return self.r
 
     def get_S(self):
-        # eigenvalues of S_k, bounded below by S_lower_bound; in the non-diagonal
-        # branch the rotation is orthogonal, so S_k - S_lower_bound * I keeps them
-        S_eigenvalues = self.S_lower_bound + torch.exp(self.S_log_diagonal_matrix)
+        S_eigenvalues = self.S_lower_bound + (
+            self.S_upper_bound - self.S_lower_bound
+        ) * self.S_eigenvalue_logits.sigmoid()
         if self.is_diagonal:
             S = S_eigenvalues
         else:
@@ -83,15 +70,13 @@ class Schr_Bridge(nn.Module):
         return (1 / self.epsilon) * self.log_alpha_raw
 
     def ou_sigma(self, b, t=1.0):
-        bt = b * t
-        if abs(bt) < 1e-1:
-            return t * (1 - bt + (2/3) * bt**2 - (1/3) * bt**3 + (2/15) * bt**4)
-        else:
-            return (1 - torch.exp(-2*b*t)) / (2*b)
+        if b == 0:
+            return torch.as_tensor(t, device=self.b.device, dtype=self.r.dtype)
+        return -torch.expm1(-2 * b * t) / (2 * b)
 
     @torch.no_grad()
     def forward(self, x):
-        S = self.get_S()
+        S = self.ou_sigma(self.b, self.T) * self.get_S()
         r = self.get_r()
         b = self.b
         m = self.m
@@ -142,7 +127,7 @@ class Schr_Bridge(nn.Module):
         return torch.cat(samples, dim=0)
 
     def get_log_potential(self, x):
-        S = self.get_S()
+        S = self.ou_sigma(self.b, self.T) * self.get_S()
         r = self.get_r()
         log_alpha = self.get_log_alpha()
         epsilon = self.epsilon
@@ -162,12 +147,12 @@ class Schr_Bridge(nn.Module):
         b = self.b
         log_alpha = self.get_log_alpha()
         r = self.get_r()
-        S = self.get_S()
+        S = self.ou_sigma(self.b, self.T) * self.get_S()
         D = self.dim
 
-        m_vec = m.expand(D).float() if m.dim() == 0 else m.float()
+        m_vec = m.expand(D).to(S)
 
-        sigma_T_sq = torch.clamp((1 - torch.exp(-2*b*t)) / (2*b), min=1e-8)
+        sigma_T_sq = self.ou_sigma(b, t)
         a = 1.0 / (2 * epsilon * sigma_T_sq)
 
         if self.is_diagonal:
@@ -181,17 +166,17 @@ class Schr_Bridge(nn.Module):
                    - 0.5 / epsilon * torch.sum(r**2 * S_k_inv, dim=-1))
 
             A_k_inv_diag = 1.0 / A_k_diag
-            log_det_A_k = torch.sum(torch.log(torch.abs(A_k_diag)), dim=-1)
+            log_det_A_k = torch.sum(torch.log(A_k_diag), dim=-1)
             quadratic_term = 0.5 * torch.sum(b_k**2 * A_k_inv_diag, dim=-1)
             log_det_S_k = torch.sum(torch.log(S), dim=-1)
         else:
-            Sigma_inv = ((2.0 / epsilon) * torch.eye(D, device=m.device)).float()
+            Sigma_inv = (2.0 / epsilon) * torch.eye(D, device=m.device, dtype=S.dtype)
             log_det_Sigma = D * torch.log(epsilon / 2)
 
-            S_k_inv = torch.linalg.inv(S).float()
+            S_k_inv = torch.linalg.inv(S)
             A_k = (b * Sigma_inv[None, :, :]
                    + (1.0/epsilon) * S_k_inv
-                   - 2*a * torch.eye(D, device=m.device)[None, :, :])
+                   - 2*a * torch.eye(D, device=m.device, dtype=S.dtype)[None, :, :])
             A_k_inv = torch.linalg.inv(A_k)
             b_k = (b * torch.einsum('ij,j->i', Sigma_inv, m_vec)[None, :]
                    + (1.0/epsilon) * torch.einsum('kij,kj->ki', S_k_inv, r))
